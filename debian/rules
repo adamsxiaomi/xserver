@@ -2,7 +2,7 @@
 
 ifeq ($(DEB_HOST_ARCH_OS), linux)
 	selinux        = --enable-xselinux
-	wayland        = --enable-xwayland
+	wayland        = --disable-xwayland
 	logind         = --enable-systemd-logind
 	systemd-daemon = --with-systemd-daemon
 else
