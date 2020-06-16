@@ -73,13 +73,14 @@ static struct ms_exa_pixmap_priv *exa_scratch_pixmap;
 static inline RgaSURF_FORMAT
 rga_get_pixmap_format(PixmapPtr pPix)
 {
+    /* HACK: reverse all formats since RGA doesn't support BGRX */
     switch (pPix->drawable.bitsPerPixel) {
     case 32:
-        return RK_FORMAT_BGRA_8888;
-    case 16:
-        return RK_FORMAT_RGB_565;
+        if (pPix->drawable.depth == 32)
+            return RK_FORMAT_RGBA_8888; /* should be BGRA_8888 */
+        return RK_FORMAT_RGBX_8888; /* should be BGRX_8888 */
     case 12:
-        return RK_FORMAT_YCbCr_420_SP;
+        return RK_FORMAT_YCrCb_420_SP; /* should be YCbCr_420_SP */
     default:
         return RK_FORMAT_UNKNOWN;
     }
@@ -109,7 +110,7 @@ rga_prepare_info(PixmapPtr pPixmap, rga_info_t *info,
     format = rga_get_pixmap_format(pPixmap);
 
     /* rga requires yuv image rect align to 2 */
-    if (format == RK_FORMAT_YCbCr_420_SP) {
+    if (pPixmap->drawable.bitsPerPixel == 12) {
         x = (x + 1) & ~1;
         y = (y + 1) & ~1;
         w = w & ~1;
@@ -382,7 +383,7 @@ ms_exa_check_composite(int op,
 {
 #ifdef MODESETTING_WITH_RGA
     /* TODO: Support other op */
-    if (op != PictOpSrc)
+    if (op != PictOpSrc && op != PictOpOver)
         return FALSE;
 
     /* TODO: Support mask */
@@ -401,39 +402,19 @@ ms_exa_check_composite(int op,
 }
 
 static Bool
-ms_exa_prepare_composite(int op,
-                         PicturePtr pSrcPicture,
-                         PicturePtr pMaskPicture,
-                         PicturePtr pDstPicture,
-                         PixmapPtr pSrc, PixmapPtr pMask, PixmapPtr pDst)
+ms_exa_parse_transform(PictTransformPtr t, int *rotate, Bool *reflect_y)
 {
-#ifdef MODESETTING_WITH_RGA
-    PictTransformPtr t = pSrcPicture->transform;
     PictVector v;
     double x, y, dx, dy;
     int r1, r2;
 
-    if (!rga_check_pixmap(pSrc))
-        return FALSE;
-
-    if (!rga_check_pixmap(pDst))
-        return FALSE;
-
-    if (pDst == pSrc)
-        return FALSE;
-
-    /* TODO: Support repeat */
-    if (pSrcPicture->repeat)
-        return FALSE;
-
-    /* TODO: Handle pSrcPicture->filter */
-
     if (!t) {
-        exa_prepare_args.composite.rotate = 0;
-        exa_prepare_args.composite.reflect_y = 0;
-        goto out;
+        *rotate = 0;
+        *reflect_y = FALSE;
+        return TRUE;
     }
 
+    /* Only support affine matrix */
     if (t->matrix[2][0] || t->matrix[2][1] || !t->matrix[2][2])
         return FALSE;
 
@@ -460,10 +441,40 @@ ms_exa_prepare_composite(int op,
     y = pixman_fixed_to_double(v.vector[1]) - dy;
     r2 = (int) ANGLE(atan2(y, x) * 180 / M_PI - 90);
 
-    exa_prepare_args.composite.rotate = 360 - r1;
-    exa_prepare_args.composite.reflect_y = r1 != r2;
+    *rotate = (360 - r1) % 360;
+    *reflect_y = r1 != r2;
 
-out:
+    return TRUE;
+}
+
+static Bool
+ms_exa_prepare_composite(int op,
+                         PicturePtr pSrcPicture,
+                         PicturePtr pMaskPicture,
+                         PicturePtr pDstPicture,
+                         PixmapPtr pSrc, PixmapPtr pMask, PixmapPtr pDst)
+{
+#ifdef MODESETTING_WITH_RGA
+    PictTransformPtr t = pSrcPicture->transform;
+
+    if (!rga_check_pixmap(pSrc))
+        return FALSE;
+
+    if (!rga_check_pixmap(pDst))
+        return FALSE;
+
+    if (pDst == pSrc)
+        return FALSE;
+
+    /* TODO: Support repeat */
+    if (pSrcPicture->repeat)
+        return FALSE;
+
+    /* TODO: Handle pSrcPicture->filter */
+
+    if (!ms_exa_parse_transform(t, &exa_prepare_args.composite.rotate,
+                                &exa_prepare_args.composite.reflect_y))
+        return FALSE;
 #endif
     exa_prepare_args.composite.op = op;
     exa_prepare_args.composite.pSrcPicture = pSrcPicture;
@@ -520,7 +531,8 @@ ms_exa_composite(PixmapPtr pDst, int srcX, int srcY,
     rga_info_t tmp_info = {0};
     Bool reflect_y = exa_prepare_args.composite.reflect_y;
     int rotate = exa_prepare_args.composite.rotate;
-    int sw, sh;
+    int op = exa_prepare_args.composite.op;
+    int sw, sh, blend = 0;
 
     /* skip small images */
     if (width * height <= 4096)
@@ -543,6 +555,10 @@ ms_exa_composite(PixmapPtr pDst, int srcX, int srcY,
     if (!rga_prepare_info(pDst, &dst_info, dstX, dstY, width, height))
         goto bail;
 
+    /* dst = src + (1 - src.a) * dst */
+    if (op == PictOpOver)
+        blend = 0xFF0105;
+
     if (rotate == 90)
         src_info.rotation = HAL_TRANSFORM_ROT_90;
     else if (rotate == 180)
@@ -561,6 +577,7 @@ ms_exa_composite(PixmapPtr pDst, int srcX, int srcY,
         rga_set_rect(&tmp_info.rect, 0, 0, width, height,
                      width, height, rga_get_pixmap_format(pDst));
 
+        src_info.blend = blend;
         if (c_RkRgaBlit(&src_info, &tmp_info, NULL) < 0)
             goto bail;
 
@@ -570,6 +587,7 @@ ms_exa_composite(PixmapPtr pDst, int srcX, int srcY,
     if (reflect_y)
         src_info.rotation = HAL_TRANSFORM_FLIP_V;
 
+    src_info.blend = blend;
     if (c_RkRgaBlit(&src_info, &dst_info, NULL) < 0)
         goto bail;
 
@@ -946,8 +964,6 @@ ms_exa_copy_area_bail(PixmapPtr pSrc, PixmapPtr pDst,
                       pixman_f_transform_t *transform, RegionPtr clip)
 {
     ScreenPtr screen = pSrc->drawable.pScreen;
-    ScrnInfoPtr scrn = xf86ScreenToScrn(screen);
-    modesettingPtr ms = modesettingPTR(scrn);
     PictFormatPtr format = PictureWindowFormat(screen->root);
     PicturePtr src = NULL, dst = NULL;
     pixman_transform_t t;
@@ -955,8 +971,8 @@ ms_exa_copy_area_bail(PixmapPtr pSrc, PixmapPtr pDst,
     BoxPtr box;
     int n, error;
 
-    if (pSrc->drawable.bitsPerPixel != ms->drmmode.kbpp ||
-        pDst->drawable.bitsPerPixel != ms->drmmode.kbpp)
+    if (pSrc->drawable.bitsPerPixel == 12 ||
+        pDst->drawable.bitsPerPixel == 12)
         return FALSE;
 
     src = CreatePicture(None, &pSrc->drawable,
@@ -1024,12 +1040,31 @@ ms_exa_copy_area(PixmapPtr pSrc, PixmapPtr pDst,
     if (!rga_check_pixmap(pDst))
         goto bail;
 
+    /* Fallback to compositor for rotate / reflect */
+    if (transform) {
+        pixman_transform_t t;
+        Bool reflect_y = FALSE;
+        int rotate = 0;
+
+        pixman_transform_from_pixman_f_transform(&t, transform);
+        if (!ms_exa_parse_transform(&t, &rotate, &reflect_y))
+            goto bail;
+
+        if (rotate || reflect_y)
+            goto bail;
+    }
+
     region = RegionDuplicate(clip);
     n = REGION_NUM_RECTS(region);
 
     while(n--) {
         int sx, sy, sw, sh, dx, dy, dw, dh;
         box = REGION_RECTS(region) + n;
+
+        box->x1 = max(box->x1, 0);
+        box->y1 = max(box->y1, 0);
+        box->x2 = min(box->x2, pDst->drawable.width);
+        box->y2 = min(box->y2, pDst->drawable.height);
 
         dx = box->x1;
         dy = box->y1;
